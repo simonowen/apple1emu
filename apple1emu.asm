@@ -55,7 +55,7 @@ start:         di
 
 reset_loop:    ld   hl,0
                ld   (dsp_data),hl   ; display ready
-               ld   (kbd_ctrl),hl   ; no key available
+               ld   (kbd_data),hl   ; no key available
 
                ld   hl,(m6502_reset) ; start from reset vector
                ld   (reg_pc),hl
@@ -271,22 +271,26 @@ update_io:
                in   a,(status)
                and  %00100000
                jr   nz,not_esc      ; jump if Esc not pressed
-still_esc:     ld   a,&f7
-               in   a,(status)
-               and  %00100000
-               jr   z,still_esc     ; wait until Esc released
 
                call clear_file      ; Esc cancels type-in mode
 
                ld   a,&fe
                in   a,(keyboard)
                rra
-               ld   a,&1b           ; Esc character
+               jr   c,not_reset     ; unshifted gives chr
+
+               ld   a,&c9           ; RET opcode
+               ld   (main_loop),a   ; return to reset on next instruction
+not_reset:
                jr   c,got_key       ; unshifted gives chr
 
-               ld   a,&c9           ; RET
-               ld   (main_loop),a   ; exit to reset at next instruction
-               jr   no_key
+still_esc:     ld   a,&f7
+               in   a,(status)
+               and  %00100000
+               jr   z,still_esc     ; wait until Esc released
+
+               ld   a,&1b           ; Esc character
+               jr   got_key
 not_esc:
                ld   a,&7f
                in   a,(keyboard)
@@ -682,19 +686,19 @@ i_bra:         ld   a,(de)          ; unconditional branch [65C02]
                jr   i_branch
 
 i_bbr_0:       ld   a,%00000001     ; BBRn [65C02]
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_1:       ld   a,%00000010
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_2:       ld   a,%00000100
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_3:       ld   a,%00001000
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_4:       ld   a,%00010000
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_5:       ld   a,%00100000
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_6:       ld   a,%01000000
-               jp   i_bbs
+               jp   i_bbr
 i_bbr_7:       ld   a,%10000000
 i_bbr:         ex   de,hl
                ld   e,(hl)
