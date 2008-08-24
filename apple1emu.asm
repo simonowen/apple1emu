@@ -1,15 +1,18 @@
-; Apple 1 emulator for SAM Coupe v1.1, by Simon Owen
+; Apple 1 emulator for SAM Coupe, by Simon Owen
+;
+; Version 1.1 (24/8/2008)
 ;
 ; WWW: http://simonowen.com/sam/apple1emu/
 
-base:          equ  &b000           ; Spare-ish Apple 1 space
+base:          equ  &a000           ; Spare-ish Apple 1 space
 
-status:        equ  249             ; Status and extended keyboard port
-lmpr:          equ  250             ; Low Memory Page Register
-hmpr:          equ  251             ; High Memory Page Register
-vmpr:          equ  252             ; Video Memory Page Register
-keyboard:      equ  254             ; Keyboard port
-border:        equ  254             ; Border port
+status:        equ  &f9             ; Status and extended keyboard port
+lmpr:          equ  &fa             ; Low Memory Page Register
+hmpr:          equ  &fb             ; High Memory Page Register
+vmpr:          equ  &fc             ; Video Memory Page Register
+keyboard:      equ  &fe             ; Keyboard port
+border:        equ  &fe             ; Border port
+
 rom0_off:      equ  %00100000       ; LMPR bit to disable ROM0
 rom1_on:       equ  %01000000       ; LMPR bit to enable ROM1
 vmpr_mode2:    equ  %00100000       ; Mode 2 select for VMPR
@@ -18,14 +21,13 @@ low_page:      equ  3               ; LMPR during emulation
 screen_page:   equ  5               ; SAM display
 file_page:     equ  6               ; File import text page
 
-bord_stp:      equ  2               ; STP instruction halted CPU (red)
-bord_wai:      equ  6               ; WAI instruction waiting for interrupt (yellow)
+bord_invalid:  equ  2               ; Invalid instruction (red)
 
 m6502_nmi:     equ  &fffa           ; nmi vector address
 m6502_reset:   equ  &fffc           ; reset vector address
 m6502_int:     equ  &fffe           ; int vector address (also for BRK)
 
-getkey:        equ &1cab            ; SAM ROM key reading (NZ=got key in A, A=0 for no key)
+getkey:        equ  &1cab           ; SAM ROM key reading (NZ=got key in A, A=0 for no key)
 
 
 ; Apple 1 keyboard and display I/O locations
@@ -49,7 +51,6 @@ start:         di
                out  (vmpr),a
                ld   sp,stack_top
 
-               call reorder_decode  ; optimise instruction decode table
                call set_sam_attrs   ; set the mode 2 attrs so the screen is visible
                call setup_im2       ; enable IM 2
 
@@ -59,9 +60,13 @@ reset_loop:    ld   hl,0
 
                ld   hl,(m6502_reset) ; start from reset vector
                ld   (reg_pc),hl
+               ld   a,&04           ; interrupts disabled
+               ld   (reg_p),a
 
                ei
+               call load_state
                call execute         ; GO!
+               call save_state
                jr   reset_loop
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -431,1443 +436,58 @@ im2_jp:        jp   im2_handler
 ; 65C02 emulation
 
 execute:       ld   a,&1a           ; LD A,(DE)
-               ld   (main_loop),a
-               call load_state
-               jr   main_loop
+               ld   (ix),a
+               jp   (ix)
+
+
+i_undoc_3:     inc  de              ; 3-byte NOP
+i_undoc_2:     inc  de              ; 2-byte NOP
+i_undoc_1:     ld   a,bord_invalid
+               out  (border),a
+               jp   (ix)
+
 
 read_write_loop:
 write_loop:    ld   a,h
-               cp   &d0
-               jr   z,io_write
+               cp   &d0             ; I/O area?
+               jr   z,write_trap
 
 zwrite_loop:
-zread_write_loop:
-main_loop:     ld   a,(de)          ; fetch opcode
-               inc  de              ; PC=PC+1
-               ld   l,a
-               ld   h,decode_table/256
-               ld   a,(hl)          ; handler low
-               inc  h
-               ld   h,(hl)          ; handler high
-               ld   l,a
-               jp   (hl)            ; execute!
+main_loop:     ld   a,(de)          ; 7/7/15  - fetch opcode
+               inc  de              ; 6/7/11  - PC++
+               ld   l,a             ; 4/6/6   - LSB is opcode
+               ld   h,msb_table/256 ; 7/7/15  - look-up table
+               ld   h,(hl)          ; 7/8/16  - opcode MSB
+               jp   (hl)            ; 4/5/9   - execute!
+                                    ; = 35T (official) / 40T (off-screen) / 72T (on-screen)
 
-               ; I/O write
-io_write:      ld   a,l
+write_trap:    ld   a,l
                cp   &12             ; display char?
-               jr   nz,main_loop
-               set  7,(hl)          ; display busy
-               jp   main_loop
+               jr   z,chr_write
+               jp   (ix)
+chr_write:     set  7,(hl)          ; display busy
+               jp   (ix)
 
-read_loop:
-zread_loop:    ld   a,h
+read_loop:     ld   a,h
                cp   &d0
-               jr   z,io_read
+               jr   z,read_trap
 
                ld   a,(de)          ; fetch opcode
-               inc  de              ; PC=PC+1
-               ld   l,a
-               ld   h,decode_table/256
-               ld   a,(hl)          ; handler low
-               inc  h
-               ld   h,(hl)          ; handler high
-               ld   l,a
+               inc  de              ; PC++
+               ld   l,a             ; LSB is opcode
+               ld   h,msb_table/256 ; look-up table
+               ld   h,(hl)          ; opcode MSB
                jp   (hl)            ; execute!
 
-io_read:       ld   a,l
+read_trap:     ld   a,l
                cp   &10             ; key read?
-               jr   nz,main_loop
-               inc  l
+               jr   z,key_read
+               jp   (ix)
+key_read:      inc  l
                res  7,(hl)          ; key not available
-               jp   main_loop
-
-
-; 6502 addressing modes, shared by logical and arithmetic
-; instructions, but inlined into the load and store.
-
-a_indirect_x:  ld   a,(de)          ; indirect pre-indexed with X
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               inc  hl
-               ld   h,(hl)
-               ld   l,a
                jp   (ix)
-
-a_zero_page:   ld   a,(de)          ; zero-page
-               inc  de
-               ld   l,a
-               ld   h,0
-               jp   (ix)
-
-a_absolute:    ex   de,hl           ; absolute (2-bytes)
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               jp   (ix)
-
-a_indirect_y:  ld   a,(de)          ; indirect post-indexed with Y
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               inc  l               ; (may wrap in zero page)
-               ld   h,(hl)
-               ld   l,a
-               ld   a,0
-               adc  a,h
-               ld   h,a
-               jp   (ix)
-
-a_zero_page_x: ld   a,(de)          ; zero-page indexed with X
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               jp   (ix)
-
-a_zero_page_y: ld   a,(de)          ; zero-page indexed with Y
-               inc  de
-               add  a,iyl           ; add Y (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               jp   (ix)
-
-a_absolute_y:  ex   de,hl           ; absolute indexed with Y
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               jp   (ix)
-
-a_absolute_x:  ex   de,hl           ; absolute indexed with X
-               ld   a,iyh           ; X
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               jp   (ix)
-
-a_indirect_z:  ld   a,(de)          ; indirect zero-page [65C02]
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               inc  l               ; (may wrap in zero page)
-               ld   h,(hl)
-               ld   l,a
-               ld   a,(hl)
-               inc  hl
-               ld   h,(hl)
-               ld   l,a
-               jp   (ix)
-
-; Instruction implementations
-
-i_nop:         equ  main_loop
-i_undoc_1:     equ  main_loop
-i_undoc_3:     inc  de              ; 3-byte NOP
-i_undoc_2:     inc  de              ; 2-byte NOP
-               jp   main_loop
-
-i_clc:         exx                  ; clear carry
-               ld   c,0
-               exx
-               jp   main_loop
-i_sec:         exx                  ; set carry
-               ld   c,1
-               exx
-               jp   main_loop
-i_cli:         exx                  ; clear interrupt disable
-               res  2,d
-               exx
-               jp   main_loop
-i_sei:         exx                  ; set interrupt disable
-               set  2,d
-               exx
-               jp   main_loop
-i_clv:         exx                  ; clear overflow
-               ld   b,0
-               exx
-               jp   main_loop
-i_cld:         exx                  ; clear decimal mode
-               res  3,d
-               exx
-               xor  a               ; NOP
-               ld   (adc_daa),a     ; use binary mode for adc
-               ld   (sbc_daa),a     ; use binary mode for sbc
-               jp   main_loop
-i_sed:         exx
-               set  3,d
-               exx
-               ld   a,&27           ; DAA
-               ld   (adc_daa),a     ; use decimal mode for adc
-               ld   (sbc_daa),a     ; use decimal mode for sbc
-               jp   main_loop
-
-i_bpl:         ld   a,(de)
-               inc  de
-               ex   af,af'
-               ld   l,a             ; copy N
-               ex   af,af'
-               bit  7,l             ; test N
-               jr   z,i_branch      ; branch if plus
-               jp   main_loop
-i_bmi:         ld   a,(de)
-               inc  de
-               ex   af,af'
-               ld   l,a             ; copy N
-               ex   af,af'
-               bit  7,l             ; test N
-               jr   nz,i_branch     ; branch if minus
-               jp   main_loop
-i_bvc:         ld   a,(de)          ; V in bit 6
-               inc  de              ; V set if non-zero
-               exx
-               bit  6,b
-               exx
-               jr   z,i_branch      ; branch if V clear
-               jp   main_loop
-i_bvs:         ld   a,(de)          ; V in bit 6
-               inc  de
-               exx
-               bit  6,b
-               exx
-               jr   nz,i_branch     ; branch if V set
-               jp   main_loop
-i_bcc:         ld   a,(de)          ; C in bit 1
-               inc  de
-               exx
-               bit  0,c
-               exx
-               jr   z,i_branch      ; branch if C clear
-               jp   main_loop
-i_bcs:         ld   a,(de)
-               inc  de
-               exx
-               bit  0,c
-               exx
-               jr   nz,i_branch     ; branch if C set
-               jp   main_loop
-i_beq:         ld   a,(de)
-               inc  de
-               inc  c
-               dec  c               ; zero?
-               jr   z,i_branch      ; branch if zero
-               jp   main_loop
-i_bne:         ld   a,(de)
-               inc  de
-               inc  c
-               dec  c               ; zero?
-               jp   z,main_loop     ; no branch if not zero
-i_branch:      ld   l,a             ; offset low
-               rla                  ; set carry with sign
-               sbc  a,a             ; form high byte for offset
-               ld   h,a
-               add  hl,de           ; PC=PC+e
-               ex   de,hl
-               jp   main_loop
-i_bra:         ld   a,(de)          ; unconditional branch [65C02]
-               inc  de
-               jr   i_branch
-
-i_bbr_0:       ld   a,%00000001     ; BBRn [65C02]
-               jp   i_bbr
-i_bbr_1:       ld   a,%00000010
-               jp   i_bbr
-i_bbr_2:       ld   a,%00000100
-               jp   i_bbr
-i_bbr_3:       ld   a,%00001000
-               jp   i_bbr
-i_bbr_4:       ld   a,%00010000
-               jp   i_bbr
-i_bbr_5:       ld   a,%00100000
-               jp   i_bbr
-i_bbr_6:       ld   a,%01000000
-               jp   i_bbr
-i_bbr_7:       ld   a,%10000000
-i_bbr:         ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,0
-               ex   de,hl
-               and  (hl)
-               ld   a,(de)
-               inc  de
-               jr   z,i_branch      ; ToDo: read_loop after branch
-               jp   read_loop
-
-i_bbs_0:       ld   a,%00000001     ; BBSn [65C02]
-               jp   i_bbs
-i_bbs_1:       ld   a,%00000010
-               jp   i_bbs
-i_bbs_2:       ld   a,%00000100
-               jp   i_bbs
-i_bbs_3:       ld   a,%00001000
-               jp   i_bbs
-i_bbs_4:       ld   a,%00010000
-               jp   i_bbs
-i_bbs_5:       ld   a,%00100000
-               jp   i_bbs
-i_bbs_6:       ld   a,%01000000
-               jp   i_bbs
-i_bbs_7:       ld   a,%10000000
-i_bbs:         ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,0
-               ex   de,hl
-               and  (hl)
-               ld   a,(de)
-               inc  de
-               jr   nz,i_branch     ; ToDo: read_loop after branch
-               jp   read_loop
-
-i_jmp_a:       ex   de,hl           ; JMP nn
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               jp   main_loop
-
-i_jmp_i:       ex   de,hl           ; JMP (nn)
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   e,(hl)
-;              inc  l               ; 6502 bug wraps within page, *OR*
-               inc  hl              ; 65C02 spans pages correctly
-               ld   d,(hl)
-               jp   main_loop
-
-i_jmp_ax:      ex   de,hl           ; JMP (nn,X) [65C02]
-               ld   a,iyh           ; X
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)          ; carry spans page
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               jp   main_loop
-
-i_jsr:         ex   de,hl           ; JSR nn
-               ld   e,(hl)          ; subroutine low
-               inc  hl              ; only 1 inc - we push ret-1
-               ld   d,(hl)          ; subroutine high
-               ld   a,h             ; PCh
-               exx
-               ld   (hl),a          ; push ret-1 high byte
-               dec  l               ; S--
-               exx
-               ld   a,l             ; PCl
-               exx
-               ld   (hl),a          ; push ret-1 low byte
-               dec  l               ; S--
-               exx
-               jp   main_loop
-
-i_brk:         inc  de              ; return to BRK+2
-               ld   a,d
-               exx
-               ld   (hl),a          ; push return MSB
-               dec  l               ; S--
-               exx
-               ld   a,e
-               exx
-               ld   (hl),a          ; push return LSB
-               dec  l               ; S--
-               ld   a,d
-               or   %00010000       ; set B flag (temp)
-               ld   (hl),a          ; push flags with B set
-               dec  l               ; S--
-               set  2,d             ; set I flag
-               exx
-               ld   de,(m6502_int)  ; fetch interrupt handler
-               jp   main_loop
-
-i_rts:         exx                  ; RTS
-               inc  l               ; S++
-               ld   a,(hl)          ; PC LSB
-               exx
-               ld   e,a
-               exx
-               inc  l               ; S++
-               ld   a,(hl)          ; PC MSB
-               exx
-               ld   d,a
-               inc  de              ; PC++ (strange but true)
-               jp   main_loop
-
-i_rti:         exx                  ; RTI
-               inc  l               ; S++
-               ld   a,(hl)          ; pop P
-               or   %00110000       ; set T and B flags
-               call split_p_exx     ; split P into status+flags (already exx)
-               exx
-               inc  l               ; S++
-               ld   a,(hl)          ; pop return LSB
-               exx
-               ld   e,a
-               exx
-               inc  l               ; S++
-               ld   a,(hl)          ; pop return MSB
-               exx
-               ld   d,a
-               jp   main_loop
-
-i_php:         call make_p          ; make P from status+flags
-               or   %00010000       ; B always pushed as 1
-               exx
-               ld   (hl),a
-               dec  l               ; S--
-               exx
-               jp   main_loop
-i_plp:         exx                  ; PLP
-               inc  l               ; S++
-               ld   a,(hl)          ; P
-               or   %00110000       ; set T and B flags
-               exx
-               call split_p         ; split P into status+flags
-               jp   main_loop
-i_pha:         ld   a,b             ; PHA
-               exx
-               ld   (hl),a
-               dec  l               ; S--
-               exx
-               jp   main_loop
-i_pla:         exx                  ; PLA
-               inc  l               ; S++
-               ld   a,(hl)
-               exx
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_phx:         ld   a,iyh           ; PHX [65C02]
-               exx
-               ld   (hl),a
-               dec  l               ; S--
-               exx
-               jp   main_loop
-i_plx:         exx                  ; PLX [65C02]
-               inc  l               ; S++
-               ld   a,(hl)
-               exx
-               ld   iyh,a           ; set X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_phy:         ld   a,iyl           ; PHY [65C02]
-               exx
-               ld   (hl),a
-               dec  l               ; S--
-               exx
-               jp   main_loop
-i_ply:         exx                  ; PLY [65C02]
-               inc  l               ; S++
-               ld   a,(hl)
-               exx
-               ld   iyl,a           ; set Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-
-i_dex:         dec  iyh             ; X--
-               ld   a,iyh           ; X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_dey:         dec  iyl             ; Y--
-               ld   a,iyl           ; Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_inx:         inc  iyh             ; X++
-               ld   a,iyh           ; X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_iny:         inc  iyl             ; Y++
-               ld   a,iyl           ; Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-
-i_txa:         ld   a,iyh           ; X
-               ld   b,a             ; A=X
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_tya:         ld   a,iyl           ; Y
-               ld   b,a             ; A=Y
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_tax:         ld   iyh,b           ; X=A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   main_loop
-i_tay:         ld   iyl,b           ; Y=A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   main_loop
-i_txs:         ld   a,iyh           ; X
-               exx
-               ld   l,a             ; set S (no flags set)
-               exx
-               jp   main_loop
-i_tsx:         exx                  ; TSX
-               ld   a,l             ; fetch S
-               exx
-               ld   iyh,a           ; X=S
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-
-
-; For speed, LDA/LDX/LDY instructions have addressing inlined
-
-i_lda_ix:      ld   a,(de)          ; LDA ($nn,X)
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               inc  hl
-               ld   h,(hl)
-               ld   l,a
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_lda_z:       ld   a,(de)          ; LDA $nn
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_lda_a:       ex   de,hl           ; LDA $nnnn
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   read_loop
-i_lda_iy:      ld   a,(de)          ; LDA ($nn),Y
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               inc  l               ; (may wrap in zero page)
-               ld   h,(hl)
-               ld   l,a
-               ld   a,0
-               adc  a,h
-               ld   h,a
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   read_loop
-i_lda_zx:      ld   a,(de)          ; LDA $nn,X
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_lda_ay:      ex   de,hl           ; LDA $nnnn,Y
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   read_loop
-i_lda_ax:      ex   de,hl           ; LDA $nnnn,X
-               ld   a,iyh           ; X
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   read_loop
-i_lda_i:       ld   a,(de)          ; LDA #$nn
-               inc  de
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_lda_iz:      ld   a,(de)          ; LDA ($nn) [65C02]
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               inc  l               ; (may wrap in zero page)
-               ld   h,(hl)
-               ld   l,a
-               ld   a,(hl)
-               inc  hl
-               ld   h,(hl)
-               ld   l,a
-               ld   b,(hl)          ; set A
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_ldx_z:       ld   a,(de)          ; LDX $nn
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               ld   iyh,a           ; set X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_ldx_a:       ex   de,hl           ; LDX $nnnn
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   a,(hl)
-               ld   iyh,a           ; set X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-i_ldx_zy:      ld   a,(de)          ; LDX $nn,Y
-               inc  de
-               add  a,iyl           ; add Y (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               ld   iyh,a           ; set X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_ldx_ay:      ex   de,hl           ; LDX $nnnn,Y
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   a,(hl)
-               ld   iyh,a           ; set X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-i_ldx_i:       ld   a,(de)          ; LDX #$nn
-               inc  de
-               ld   iyh,a           ; set X
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-
-i_ldy_z:       ld   a,(de)          ; LDY $nn
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               ld   iyl,a           ; set Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_ldy_a:       ex   de,hl           ; LDY $nnnn
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   a,(hl)
-               ld   iyl,a           ; set Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-i_ldy_zx:      ld   a,(de)          ; LDY $nn,X
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               ld   iyl,a           ; set Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   zread_loop
-i_ldy_ax:      ex   de,hl           ; LDY $nnnn,X
-               ld   a,iyh           ; X
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   a,(hl)
-               ld   iyl,a           ; set Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-i_ldy_i:       ld   a,(de)          ; LDY #$nn
-               inc  de
-               ld   iyl,a           ; set Y
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-
-
-; For speed, STA/STX/STY instructions have addressing inlined
-
-i_sta_ix:      ld   a,(de)          ; STA ($xx,X)
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               inc  hl
-               ld   h,(hl)
-               ld   l,a
-               ld   (hl),b
-               jp   zwrite_loop
-i_sta_z:       ld   a,(de)          ; STA $nn
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   (hl),b
-               jp   zwrite_loop
-i_sta_iy:      ld   a,(de)
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               inc  l
-               ld   h,(hl)
-               ld   l,a
-               ld   a,0
-               adc  a,h
-               ld   h,a
-               ld   (hl),b
-               jp   write_loop
-i_sta_zx:      ld   a,(de)
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   (hl),b
-               jp   zwrite_loop
-i_sta_ay:      ex   de,hl
-               ld   a,iyl           ; Y
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   (hl),b
-               jp   write_loop
-
-i_sta_ax:      ex   de,hl
-               ld   a,iyh           ; X
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   (hl),b
-               jp   write_loop
-i_sta_a:       ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   (hl),b
-               jp   write_loop
-i_sta_iz:      ld   a,(de)          ; STA ($nn) [65C02]
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,(hl)
-               inc  l               ; (may wrap in zero page)
-               ld   h,(hl)
-               ld   l,a
-               ld   a,(hl)
-               inc  hl
-               ld   h,(hl)
-               ld   l,a
-               ld   (hl),b          ; store A
-               jp   write_loop
-
-i_stx_z:       ld   a,(de)
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,iyh           ; X
-               ld   (hl),a
-               jp   zwrite_loop
-i_stx_zy:      ld   a,(de)
-               inc  de
-               add  a,iyl           ; add Y (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,iyh           ; X
-               ld   (hl),a
-               jp   zwrite_loop
-i_stx_a:       ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   a,iyh           ; X
-               ld   (hl),a
-               jp   write_loop
-
-i_sty_z:       ld   a,(de)
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   a,iyl           ; Y
-               ld   (hl),a
-               jp   zwrite_loop
-i_sty_zx:      ld   a,(de)
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   a,iyl           ; Y
-               ld   (hl),a
-               jp   zwrite_loop
-i_sty_a:       ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   a,iyl           ; Y
-               ld   (hl),a
-               jp   write_loop
-
-i_stz_z:       ld   a,(de)          ; STZ $nn [65C02]
-               inc  de
-               ld   l,a
-               ld   h,0
-               ld   (hl),h
-               jp   zwrite_loop
-i_stz_zx:      ld   a,(de)
-               inc  de
-               add  a,iyh           ; add X (may wrap in zero page)
-               ld   l,a
-               ld   h,0
-               ld   (hl),h
-               jp   zwrite_loop
-i_stz_ax:      ex   de,hl
-               ld   a,iyh           ; X
-               add  a,(hl)
-               ld   e,a
-               inc  hl
-               ld   a,0
-               adc  a,(hl)
-               ld   d,a
-               inc  hl
-               ex   de,hl
-               ld   (hl),0
-               jp   write_loop
-i_stz_a:       ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,(hl)
-               inc  hl
-               ex   de,hl
-               ld   (hl),0
-               jp   write_loop
-
-i_adc_ix:      ld   ix,i_adc
-               jp   a_indirect_x
-i_adc_z:       ld   ix,i_adc
-               jp   a_zero_page
-i_adc_a:       ld   ix,i_adc
-               jp   a_absolute
-i_adc_zx:      ld   ix,i_adc
-               jp   a_zero_page_x
-i_adc_ay:      ld   ix,i_adc
-               jp   a_absolute_y
-i_adc_ax:      ld   ix,i_adc
-               jp   a_absolute_x
-i_adc_iy:      ld   ix,i_adc
-               jp   a_indirect_y
-i_adc_iz:      ld   ix,i_adc        ; [65C02]
-               jp   a_indirect_z
-i_adc_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_adc:         exx
-               ld   a,c             ; C
-               exx
-               rra                  ; set up carry
-               ld   a,b             ; A
-               adc  a,(hl)          ; A+M+C
-adc_daa:       nop
-               ld   b,a             ; set A
-;              jp   set_nvzc
-               ; fall through to set_nvzc...
-
-set_nvzc:      ld   c,a             ; set Z
-               rla                  ; C in bit 0, no effect on V
-               exx
-               ld   c,a             ; set C
-               jp   pe,set_v
-               ld   b,%00000000     ; V clear
-               exx
-               ld   a,c
-               ex   af,af'          ; set N
-               jp   read_loop
-set_v:         ld   b,%01000000     ; V set
-               exx
-               ld   a,c
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_sbc_ix:      ld   ix,i_sbc
-               jp   a_indirect_x
-i_sbc_z:       ld   ix,i_sbc
-               jp   a_zero_page
-i_sbc_a:       ld   ix,i_sbc
-               jp   a_absolute
-i_sbc_zx:      ld   ix,i_sbc
-               jp   a_zero_page_x
-i_sbc_ay:      ld   ix,i_sbc
-               jp   a_absolute_y
-i_sbc_ax:      ld   ix,i_sbc
-               jp   a_absolute_x
-i_sbc_iy:      ld   ix,i_sbc
-               jp   a_indirect_y
-i_sbc_iz:      ld   ix,i_sbc        ; [65C02]
-               jp   a_indirect_z
-i_sbc_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_sbc:         exx
-               ld   a,c             ; C
-               exx
-               rra                  ; set up carry
-               ld   a,b             ; A
-               ccf                  ; uses inverted carry
-               sbc  a,(hl)          ; A-M-(1-C)
-sbc_daa:       nop
-               ccf                  ; no carry for overflow
-               ld   b,a             ; set A
-               jp   set_nvzc
-
-i_and_ix:      ld   ix,i_and
-               jp   a_indirect_x
-i_and_z:       ld   ix,i_and
-               jp   a_zero_page
-i_and_a:       ld   ix,i_and
-               jp   a_absolute
-i_and_zx:      ld   ix,i_and
-               jp   a_zero_page_x
-i_and_ay:      ld   ix,i_and
-               jp   a_absolute_y
-i_and_ax:      ld   ix,i_and
-               jp   a_absolute_x
-i_and_iy:      ld   ix,i_and
-               jp   a_indirect_y
-i_and_iz:      ld   ix,i_and        ; [65C02]
-               jp   a_indirect_z
-i_and_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_and:         ld   a,b             ; A
-               and  (hl)            ; A&x
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_eor_ix:      ld   ix,i_eor
-               jp   a_indirect_x
-i_eor_z:       ld   ix,i_eor
-               jp   a_zero_page
-i_eor_a:       ld   ix,i_eor
-               jp   a_absolute
-i_eor_zx:      ld   ix,i_eor
-               jp   a_zero_page_x
-i_eor_ay:      ld   ix,i_eor
-               jp   a_absolute_y
-i_eor_ax:      ld   ix,i_eor
-               jp   a_absolute_x
-i_eor_iy:      ld   ix,i_eor
-               jp   a_indirect_y
-i_eor_iz:      ld   ix,i_eor        ; [65C02]
-               jp   a_indirect_z
-i_eor_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_eor:         ld   a,b             ; A
-               xor  (hl)            ; A^x
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_ora_ix:      ld   ix,i_ora
-               jp   a_indirect_x
-i_ora_z:       ld   ix,i_ora
-               jp   a_zero_page
-i_ora_a:       ld   ix,i_ora
-               jp   a_absolute
-i_ora_zx:      ld   ix,i_ora
-               jp   a_zero_page_x
-i_ora_ay:      ld   ix,i_ora
-               jp   a_absolute_y
-i_ora_ax:      ld   ix,i_ora
-               jp   a_absolute_x
-i_ora_iy:      ld   ix,i_ora
-               jp   a_indirect_y
-i_ora_iz:      ld   ix,i_ora        ; [65C02]
-               jp   a_indirect_z
-i_ora_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_ora:         ld   a,b             ; A
-               or   (hl)            ; A|x
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_cmp_ix:      ld   ix,i_cmp
-               jp   a_indirect_x
-i_cmp_z:       ld   ix,i_cmp
-               jp   a_zero_page
-i_cmp_a:       ld   ix,i_cmp
-               jp   a_absolute
-i_cmp_zx:      ld   ix,i_cmp
-               jp   a_zero_page_x
-i_cmp_ay:      ld   ix,i_cmp
-               jp   a_absolute_y
-i_cmp_ax:      ld   ix,i_cmp
-               jp   a_absolute_x
-i_cmp_iy:      ld   ix,i_cmp
-               jp   a_indirect_y
-i_cmp_iz:      ld   ix,i_cmp        ; [65C02]
-               jp   a_indirect_z
-i_cmp_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_cmp:         ld   a,b             ; A
-               sub  (hl)            ; A-x (result discarded)
-               ccf
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_cpx_z:       ld   ix,i_cpx
-               jp   a_zero_page
-i_cpx_a:       ld   ix,i_cpx
-               jp   a_absolute
-i_cpx_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_cpx:         ld   a,iyh           ; X
-               sub  (hl)            ; X-x (result discarded)
-               ccf
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-
-i_cpy_z:       ld   ix,i_cpy
-               jp   a_zero_page
-i_cpy_a:       ld   ix,i_cpy
-               jp   a_absolute
-i_cpy_i:       ld   h,d
-               ld   l,e
-               inc  de
-i_cpy:         ld   a,iyl           ; Y
-               sub  (hl)            ; Y-x (result discarded)
-               ccf
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   read_loop
-
-
-i_dec_z:       ld   ix,i_dec_zp
-               jp   a_zero_page
-i_dec_zx:      ld   ix,i_dec_zp
-               jp   a_zero_page_x
-i_dec_a:       ld   ix,i_dec
-               jp   a_absolute
-i_dec_ax:      ld   ix,i_dec
-               jp   a_absolute_x
-i_dec:         dec  (hl)            ; mem--
-               ld   c,(hl)          ; set Z
-               ld   a,c
-               ex   af,af'          ; set N
-               jp   read_write_loop
-i_dec_zp:      dec  (hl)            ; zero-page--
-               ld   c,(hl)          ; set Z
-               ld   a,c
-               ex   af,af'          ; set N
-               jp   zread_write_loop
-i_dec_ac:      dec  b               ; A-- [65C02]
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   main_loop
-
-i_inc_z:       ld   ix,i_inc_zp
-               jp   a_zero_page
-i_inc_zx:      ld   ix,i_inc_zp
-               jp   a_zero_page_x
-i_inc_a:       ld   ix,i_inc
-               jp   a_absolute
-i_inc_ax:      ld   ix,i_inc
-               jp   a_absolute_x
-i_inc:         inc  (hl)            ; mem++
-               ld   c,(hl)          ; set Z
-               ld   a,c
-               ex   af,af'          ; set N
-               jp   read_write_loop
-i_inc_zp:      inc  (hl)            ; zero-page++
-               ld   c,(hl)          ; set Z
-               ld   a,c
-               ex   af,af'          ; set N
-               jp   zread_write_loop
-i_inc_ac:      inc  b               ; A++ [65C02]
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   main_loop
-
-i_asl_z:       ld   ix,i_asl
-               jp   a_zero_page
-i_asl_zx:      ld   ix,i_asl
-               jp   a_zero_page_x
-i_asl_a:       ld   ix,i_asl
-               jp   a_absolute
-i_asl_ax:      ld   ix,i_asl
-               jp   a_absolute_x
-i_asl_acc:     sla  b               ; A << 1
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   main_loop
-i_asl:         ld   a,(hl)          ; x
-               add  a,a             ; x << 1
-               ld   (hl),a          ; set memory
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   write_loop
-
-i_lsr_z:       ld   ix,i_lsr
-               jp   a_zero_page
-i_lsr_zx:      ld   ix,i_lsr
-               jp   a_zero_page_x
-i_lsr_a:       ld   ix,i_lsr
-               jp   a_absolute
-i_lsr_ax:      ld   ix,i_lsr
-               jp   a_absolute_x
-i_lsr_acc:     srl  b               ; A >> 1
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,b             ; set Z
-               ld   a,b
-               ex   af,af'          ; set N
-               jp   main_loop
-i_lsr:         ld   a,(hl)          ; x
-               srl  a               ; x >> 1
-               ld   (hl),a          ; set memory
-               exx
-               rl   c               ; retrieve carry
-               exx
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   write_loop
-
-i_rol_z:       ld   ix,i_rol
-               jp   a_zero_page
-i_rol_zx:      ld   ix,i_rol
-               jp   a_zero_page_x
-i_rol_a:       ld   ix,i_rol
-               jp   a_absolute
-i_rol_ax:      ld   ix,i_rol
-               jp   a_absolute_x
-i_rol_acc:     ld   a,b
-               exx
-               rr   c               ; set up carry
-               rla                  ; A << 1
-               rl   c               ; retrieve carry
-               exx
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_rol:         ld   a,(hl)          ; x
-               exx
-               rr   c               ; set up carry
-               rla                  ; x << 1
-               rl   c               ; retrieve carry
-               exx
-               ld   (hl),a          ; set memory
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   write_loop
-
-i_ror_z:       ld   ix,i_ror
-               jp   a_zero_page
-i_ror_zx:      ld   ix,i_ror
-               jp   a_zero_page_x
-i_ror_a:       ld   ix,i_ror
-               jp   a_absolute
-i_ror_ax:      ld   ix,i_ror
-               jp   a_absolute_x
-i_ror_acc:     ld   a,b
-               exx
-               rr   c               ; set up carry
-               rra                  ; A >> 1
-               rl   c               ; retrieve carry
-               exx
-               ld   b,a             ; set A
-               ld   c,b             ; set Z
-               ex   af,af'          ; set N
-               jp   main_loop
-i_ror:         ld   a,(hl)          ; x
-               exx
-               rr   c               ; set up carry
-               rra                  ; x >> 1
-               rl   c               ; retrieve carry
-               exx
-               ld   (hl),a          ; set memory
-               ld   c,a             ; set Z
-               ex   af,af'          ; set N
-               jp   write_loop
-
-
-i_bit_z:       ld   ix,i_bit
-               jp   a_zero_page
-i_bit_zx:      ld   ix,i_bit
-               jp   a_zero_page_x
-i_bit_a:       ld   ix,i_bit
-               jp   a_absolute
-i_bit_ax:      ld   ix,i_bit
-               jp   a_absolute_x
-i_bit_i:       ld   h,d             ; BIT #$nn
-               ld   l,e
-               inc  de
-i_bit:         ld   c,(hl)          ; x
-               ld   a,c
-               ex   af,af'          ; set N
-               ld   a,c
-               and  %01000000       ; V flag set from bit 6
-               exx
-               ld   b,a             ; set V
-               exx
-               ld   a,b             ; A
-               and  c               ; perform BIT test
-               ld   c,a             ; set Z
-               jp   read_loop
-
-i_tsb_z:       ld   ix,i_tsb        ; TSB [65C02]
-               jp   a_zero_page
-i_tsb_a:       ld   ix,i_tsb
-               jp   a_absolute
-i_tsb:         ld   c,(hl)          ; x
-               ld   a,c
-               or   b               ; set bits from A
-               ld   (hl),a
-               ld   a,c
-               and  b               ; test bits against A
-               ld   c,a             ; set Z
-               jp   write_loop
-
-i_trb_z:       ld   ix,i_trb        ; TRB [65C02]
-               jp   a_zero_page
-i_trb_a:       ld   ix,i_trb
-               jp   a_absolute
-i_trb:         ld   c,(hl)          ; x
-               ld   a,b             ; A
-               cpl                  ; ~A
-               and  c               ; reset bits from A
-               ld   (hl),a
-               ld   a,c
-               and  b               ; test bits against A
-               ld   c,a             ; set Z
-               jp   write_loop
-
-i_smb_0:       ld   a,%00000001     ; SMBn [65C02]
-               jp   i_smb
-i_smb_1:       ld   a,%00000010
-               jp   i_smb
-i_smb_2:       ld   a,%00000100
-               jp   i_smb
-i_smb_3:       ld   a,%00001000
-               jp   i_smb
-i_smb_4:       ld   a,%00010000
-               jp   i_smb
-i_smb_5:       ld   a,%00100000
-               jp   i_smb
-i_smb_6:       ld   a,%01000000
-               jp   i_smb
-i_smb_7:       ld   a,%10000000
-i_smb:         ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,0
-               ex   de,hl
-               or   (hl)
-               ld   (hl),a
-               jp   zwrite_loop
-
-i_rmb_0:       ld   a,%11111110     ; RMBn [65C02]
-               jp   i_smb
-i_rmb_1:       ld   a,%11111101
-               jp   i_smb
-i_rmb_2:       ld   a,%11111011
-               jp   i_smb
-i_rmb_3:       ld   a,%11110111
-               jp   i_smb
-i_rmb_4:       ld   a,%11101111
-               jp   i_smb
-i_rmb_5:       ld   a,%11011111
-               jp   i_smb
-i_rmb_6:       ld   a,%10111111
-               jp   i_smb
-i_rmb_7:       ld   a,%01111111
-i_rmb:         ex   de,hl
-               ld   e,(hl)
-               inc  hl
-               ld   d,0
-               ex   de,hl
-               and  (hl)
-               ld   (hl),a
-               jp   zwrite_loop
-
-i_stp:         dec  de              ; STP [65C02]
-               ld   a,bord_stp
-               out  (border),a
-               jp   main_loop
-
-i_wai:         dec  de              ; WAI [65C02]
-               ld   a,bord_wai
-               out  (border),a
-               jp   main_loop
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-make_p:        ex   af,af'
-               and  %10000000       ; keep N
-               ld   l,a             ; N
-               ex   af,af'
-               ld   a,c             ; Z
-               sub  1               ; set carry if zero
-               rla
-               rla
-               and  %00000010       ; keep 6510 Z bit
-               or   l               ; N+Z
-               exx
-               or   b               ; N+V+Z
-               ld   e,a
-               ld   a,c
-               and  %00000001       ; keep C
-               or   e               ; N+V+Z+C
-               exx
-               ret
-
-split_p:       exx
-split_p_exx:   ld   e,a             ; save P
-               and  %00111100       ; keep CPU bits
-               ld   d,a             ; set status
-               ld   a,e
-               ex   af,af'          ; set N
-               ld   a,e
-               and  %01000000       ; keep V
-               ld   b,a             ; set V
-               ld   a,e
-               and  %00000001       ; keep C
-               ld   c,a             ; set C
-               ld   a,e
-               cpl
-               and  %00000010       ; Z=0 NZ=2
-               exx
-               ld   c,a             ; set NZ
-               ret
 
 load_state:    ld   a,(reg_a)
                ld   b,a             ; set A
@@ -1879,10 +499,24 @@ load_state:    ld   a,(reg_a)
                ld   a,(reg_s)
                ld   l,a             ; set S
                ld   h,&01           ; MSB for stack pointer
-               exx
                ld   a,(reg_p)
-               call split_p         ; set P and flags
+               ld   c,a             ; keep safe
+               and  %00001100       ; keep D and I
+               or   %00110000       ; force T and B
+               ld   d,a             ; set P
+               ld   a,c
+               and  %01000000       ; keep V
+               ld   e,a             ; set V
+               ld   a,c
+               rra                  ; carry from C
+               ex   af,af'          ; set carry
+               ld   a,c
+               and  %10000010       ; keep N Z
+               xor  %00000010       ; zero for Z
+               exx
+               ld   c,a             ; set N Z
                ld   de,(reg_pc)     ; set PC
+               ld   ix,main_loop    ; decode loop
                ret
 
 save_state:    ld   a,b             ; get A
@@ -1891,16 +525,30 @@ save_state:    ld   a,b             ; get A
                ld   (reg_x),a
                ld   a,iyl           ; get Y from IYl
                ld   (reg_y),a
+               ex   af,af'          ; carry
+               inc  c
+               dec  c               ; set N Z
+               push af              ; save flags
+               ex   af,af'          ; protect carry
                exx
+               pop  bc
+               ld   a,c
+               and  %10000001       ; keep Z80 N and C
+               bit  6,c             ; check Z80 Z
+               jr   z,save_nz
+               or   %00000010       ; set Z
+save_nz:       or   e               ; merge V
+               or   d               ; merge T B D I
+               ld   (reg_p),a
                ld   a,l             ; get S
                ld   (reg_s),a
                exx
-               call make_p          ; get P
                ld   (reg_pc),de
                ret
 
-; While running we have the 6502 registers in Z80 registers
-; These are used only to hold the state before/afterwards
+
+; During running we keep the 65xx registers in Z80 registers
+; These are used only to hold the state before/after running
 reg_a:         defb 0
 reg_p:         defb 0
 reg_x:         defb 0
@@ -1908,117 +556,46 @@ reg_y:         defb 0
 reg_s:         defb 0
 reg_pc:        defw 0
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; Reordering the decode table to group low and high bytes means
-; we avoid any 16-bit arithmetic for the decode stage, saving
-; 12T on the old method (cool tip from Dave Laundon)
+               defs -$\256
 
-reorder_256:   equ  im2_table
+msb_table:     defb op_00>>8, op_01>>8, op_02>>8, op_03>>8, op_04>>8, op_05>>8, op_06>>8, op_07>>8
+               defb op_08>>8, op_09>>8, op_0a>>8, op_0b>>8, op_0c>>8, op_0d>>8, op_0e>>8, op_0f>>8
+               defb op_10>>8, op_11>>8, op_12>>8, op_13>>8, op_14>>8, op_15>>8, op_16>>8, op_17>>8
+               defb op_18>>8, op_19>>8, op_1a>>8, op_1b>>8, op_1c>>8, op_1d>>8, op_1e>>8, op_1f>>8
+               defb op_20>>8, op_21>>8, op_22>>8, op_23>>8, op_24>>8, op_25>>8, op_26>>8, op_27>>8
+               defb op_28>>8, op_29>>8, op_2a>>8, op_2b>>8, op_2c>>8, op_2d>>8, op_2e>>8, op_2f>>8
+               defb op_30>>8, op_31>>8, op_32>>8, op_33>>8, op_34>>8, op_35>>8, op_36>>8, op_37>>8
+               defb op_38>>8, op_39>>8, op_3a>>8, op_3b>>8, op_3c>>8, op_3d>>8, op_3e>>8, op_3f>>8
+               defb op_40>>8, op_41>>8, op_42>>8, op_43>>8, op_44>>8, op_45>>8, op_46>>8, op_47>>8
+               defb op_48>>8, op_49>>8, op_4a>>8, op_4b>>8, op_4c>>8, op_4d>>8, op_4e>>8, op_4f>>8
+               defb op_50>>8, op_51>>8, op_52>>8, op_53>>8, op_54>>8, op_55>>8, op_56>>8, op_57>>8
+               defb op_58>>8, op_59>>8, op_5a>>8, op_5b>>8, op_5c>>8, op_5d>>8, op_5e>>8, op_5f>>8
+               defb op_60>>8, op_61>>8, op_62>>8, op_63>>8, op_64>>8, op_65>>8, op_66>>8, op_67>>8
+               defb op_68>>8, op_69>>8, op_6a>>8, op_6b>>8, op_6c>>8, op_6d>>8, op_6e>>8, op_6f>>8
+               defb op_70>>8, op_71>>8, op_72>>8, op_73>>8, op_74>>8, op_75>>8, op_76>>8, op_77>>8
+               defb op_78>>8, op_79>>8, op_7a>>8, op_7b>>8, op_7c>>8, op_7d>>8, op_7e>>8, op_7f>>8
+               defb op_80>>8, op_81>>8, op_82>>8, op_83>>8, op_84>>8, op_85>>8, op_86>>8, op_87>>8
+               defb op_88>>8, op_89>>8, op_8a>>8, op_8b>>8, op_8c>>8, op_8d>>8, op_8e>>8, op_8f>>8
+               defb op_90>>8, op_91>>8, op_92>>8, op_93>>8, op_94>>8, op_95>>8, op_96>>8, op_97>>8
+               defb op_98>>8, op_99>>8, op_9a>>8, op_9b>>8, op_9c>>8, op_9d>>8, op_9e>>8, op_9f>>8
+               defb op_a0>>8, op_a1>>8, op_a2>>8, op_a3>>8, op_a4>>8, op_a5>>8, op_a6>>8, op_a7>>8
+               defb op_a8>>8, op_a9>>8, op_aa>>8, op_ab>>8, op_ac>>8, op_ad>>8, op_ae>>8, op_af>>8
+               defb op_b0>>8, op_b1>>8, op_b2>>8, op_b3>>8, op_b4>>8, op_b5>>8, op_b6>>8, op_b7>>8
+               defb op_b8>>8, op_b9>>8, op_ba>>8, op_bb>>8, op_bc>>8, op_bd>>8, op_be>>8, op_bf>>8
+               defb op_c0>>8, op_c1>>8, op_c2>>8, op_c3>>8, op_c4>>8, op_c5>>8, op_c6>>8, op_c7>>8
+               defb op_c8>>8, op_c9>>8, op_ca>>8, op_cb>>8, op_cc>>8, op_cd>>8, op_ce>>8, op_cf>>8
+               defb op_d0>>8, op_d1>>8, op_d2>>8, op_d3>>8, op_d4>>8, op_d5>>8, op_d6>>8, op_d7>>8
+               defb op_d8>>8, op_d9>>8, op_da>>8, op_db>>8, op_dc>>8, op_dd>>8, op_de>>8, op_df>>8
+               defb op_e0>>8, op_e1>>8, op_e2>>8, op_e3>>8, op_e4>>8, op_e5>>8, op_e6>>8, op_e7>>8
+               defb op_e8>>8, op_e9>>8, op_ea>>8, op_eb>>8, op_ec>>8, op_ed>>8, op_ee>>8, op_ef>>8
+               defb op_f0>>8, op_f1>>8, op_f2>>8, op_f3>>8, op_f4>>8, op_f5>>8, op_f6>>8, op_f7>>8
+               defb op_f8>>8, op_f9>>8, op_fa>>8, op_fb>>8, op_fc>>8, op_fd>>8, op_fe>>8, op_ff>>8
 
-reorder_decode:ld   hl,decode_table
-               ld   d,h
-               ld   e,l
-               ld   bc,reorder_256  ; 256-byte temporary store
-reorder_lp:    ld   a,(hl)          ; low byte
-               ld   (de),a
-               inc  l
-               inc  e
-               ld   a,(hl)          ; high byte
-               ld   (bc),a
-               inc  hl
-               inc  c
-               jr   nz,reorder_lp
-               dec  h               ; back to 2nd half (high bytes)
-reorder_lp2:   ld   a,(bc)
-               ld   (hl),a
-               inc  c
-               inc  l
-               jr   nz,reorder_lp2
-               ld   a,&c9           ; RET
-               ld   (reorder_decode),A
-               ret
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-               defs -$\256          ; align table to 256-byte boundary
-
-decode_table:  DEFW i_brk,i_ora_ix,i_undoc_1,i_undoc_2     ; 00
-               DEFW i_tsb_z,i_ora_z,i_asl_z,i_rmb_0        ; 04
-               DEFW i_php,i_ora_i,i_asl_acc,i_undoc_2      ; 08
-               DEFW i_tsb_a,i_ora_a,i_asl_a,i_bbr_0        ; 0C
-
-               DEFW i_bpl,i_ora_iy,i_ora_iz,i_undoc_2      ; 10
-               DEFW i_trb_z,i_ora_zx,i_asl_zx,i_rmb_1      ; 14
-               DEFW i_clc,i_ora_ay,i_inc_ac,i_undoc_3      ; 18
-               DEFW i_trb_a,i_ora_ax,i_asl_ax,i_bbr_1      ; 1C
-
-               DEFW i_jsr,i_and_ix,i_undoc_1,i_undoc_2     ; 20
-               DEFW i_bit_z,i_and_z,i_rol_z,i_rmb_2        ; 24
-               DEFW i_plp,i_and_i,i_rol_acc,i_undoc_2      ; 28
-               DEFW i_bit_a,i_and_a,i_rol_a,i_bbr_2        ; 2C
-
-               DEFW i_bmi,i_and_iy,i_and_iz,i_undoc_2      ; 30
-               DEFW i_bit_zx,i_and_zx,i_rol_zx,i_rmb_3     ; 34
-               DEFW i_sec,i_and_ay,i_dec_ac,i_undoc_3      ; 38
-               DEFW i_bit_ax,i_and_ax,i_rol_ax,i_bbr_3     ; 3C
-
-               DEFW i_rti,i_eor_ix,i_undoc_1,i_undoc_2     ; 40
-               DEFW i_undoc_2,i_eor_z,i_lsr_z,i_rmb_4      ; 44
-               DEFW i_pha,i_eor_i,i_lsr_acc,i_undoc_2      ; 48
-               DEFW i_jmp_a,i_eor_a,i_lsr_a,i_bbr_4        ; 4C
-
-               DEFW i_bvc,i_eor_iy,i_eor_iz,i_undoc_2      ; 50
-               DEFW i_undoc_2,i_eor_zx,i_lsr_zx,i_rmb_5    ; 54
-               DEFW i_cli,i_eor_ay,i_phy,i_undoc_3         ; 58
-               DEFW i_undoc_3,i_eor_ax,i_lsr_ax,i_bbr_5    ; 5C
-
-               DEFW i_rts,i_adc_ix,i_undoc_1,i_undoc_2     ; 60
-               DEFW i_stz_z,i_adc_z,i_ror_z,i_rmb_6        ; 64
-               DEFW i_pla,i_adc_i,i_ror_acc,i_undoc_2      ; 68
-               DEFW i_jmp_i,i_adc_a,i_ror_a,i_bbr_6        ; 6C
-
-               DEFW i_bvs,i_adc_iy,i_adc_iz,i_undoc_2      ; 70
-               DEFW i_stz_zx,i_adc_zx,i_ror_zx,i_rmb_7     ; 74
-               DEFW i_sei,i_adc_ay,i_ply,i_undoc_3         ; 78
-               DEFW i_jmp_ax,i_adc_ax,i_ror_ax,i_bbr_7     ; 7C
-
-               DEFW i_bra,i_sta_ix,i_undoc_2,i_undoc_2     ; 80
-               DEFW i_sty_z,i_sta_z,i_stx_z,i_smb_0        ; 84
-               DEFW i_dey,i_bit_i,i_txa,i_undoc_2          ; 88
-               DEFW i_sty_a,i_sta_a,i_stx_a,i_bbs_0        ; 8C
-
-               DEFW i_bcc,i_sta_iy,i_sta_iz,i_undoc_2      ; 90
-               DEFW i_sty_zx,i_sta_zx,i_stx_zy,i_smb_1     ; 94
-               DEFW i_tya,i_sta_ay,i_txs,i_undoc_2         ; 98
-               DEFW i_stz_a,i_sta_ax,i_stz_ax,i_bbs_1      ; 9C
-
-               DEFW i_ldy_i,i_lda_ix,i_ldx_i,i_undoc_2     ; A0
-               DEFW i_ldy_z,i_lda_z,i_ldx_z,i_smb_2        ; A4
-               DEFW i_tay,i_lda_i,i_tax,i_undoc_2          ; A8
-               DEFW i_ldy_a,i_lda_a,i_ldx_a,i_bbs_2        ; AC
-
-               DEFW i_bcs,i_lda_iy,i_lda_iz,i_undoc_2      ; B0
-               DEFW i_ldy_zx,i_lda_zx,i_ldx_zy,i_smb_3     ; B4
-               DEFW i_clv,i_lda_ay,i_tsx,i_undoc_3         ; B8
-               DEFW i_ldy_ax,i_lda_ax,i_ldx_ay,i_bbs_3     ; BC
-
-               DEFW i_cpy_i,i_cmp_ix,i_undoc_2,i_undoc_2   ; C0
-               DEFW i_cpy_z,i_cmp_z,i_dec_z,i_smb_4        ; C4
-               DEFW i_iny,i_cmp_i,i_dex,i_wai              ; C8
-               DEFW i_cpy_a,i_cmp_a,i_dec_a,i_bbs_4        ; CC
-
-               DEFW i_bne,i_cmp_iy,i_cmp_iz,i_undoc_2      ; D0
-               DEFW i_undoc_2,i_cmp_zx,i_dec_zx,i_smb_5    ; D4
-               DEFW i_cld,i_cmp_ay,i_phx,i_stp             ; D8
-               DEFW i_undoc_3,i_cmp_ax,i_dec_ax,i_bbs_5    ; DC
-
-               DEFW i_cpx_i,i_sbc_ix,i_undoc_2,i_undoc_2   ; E0
-               DEFW i_cpx_z,i_sbc_z,i_inc_z,i_smb_6        ; E4
-               DEFW i_inx,i_sbc_i,i_nop,i_undoc_2          ; E8
-               DEFW i_cpx_a,i_sbc_a,i_inc_a,i_bbs_6        ; EC
-
-               DEFW i_beq,i_sbc_iy,i_sbc_iz,i_undoc_2      ; F0
-               DEFW i_undoc_2,i_sbc_zx,i_inc_zx,i_smb_7    ; F4
-               DEFW i_sed,i_sbc_ay,i_plx,i_undoc_3         ; F8
-               DEFW i_undoc_3,i_sbc_ax,i_inc_ax,i_bbs_7    ; FC
+               defs -$\256          ; align to 256-byte boundary
 
 font_data:
 MDAT "font.bin"
@@ -2028,8 +605,17 @@ mask_data:     defb %00000011,%11111111
                defb %11110000,%00111111
                defb %11111100,%00001111
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 end:           equ  $
 length:        equ  end-start
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Instruction implementations
+INC "opimpl.inc"
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
 ; Ken Wessen's custom BASIC+Krusader+Monitor ROM (&e000-&ffff)
