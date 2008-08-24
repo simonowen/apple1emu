@@ -1,4 +1,4 @@
-Apple 1 Emulator for SAM Coupe (v1.0)
+Apple 1 Emulator for SAM Coupe (v1.1)
 -------------------------------------
 
 Emulator Keys:
