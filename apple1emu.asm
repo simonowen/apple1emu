@@ -419,7 +419,7 @@ im2_handler:   push af
                pop  af
                ei
                reti
-end_1:
+
 
 ; IM 2 table must be aligned to 256-byte boundary
                defs -$\256
@@ -442,8 +442,9 @@ execute:       ld   a,&1a           ; LD A,(DE)
 
 i_undoc_3:     inc  de              ; 3-byte NOP
 i_undoc_2:     inc  de              ; 2-byte NOP
-i_undoc_1:     ld   a,bord_invalid
-               out  (border),a
+i_undoc_1:
+;              ld   a,bord_invalid
+;              out  (border),a
                jp   (ix)
 
 
