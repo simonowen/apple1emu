@@ -7,7 +7,7 @@ Emulator Keys:
   Symbol-1 = 50Hz terminal
   Symbol-2 = 100Hz terminal
 
-Symbol is mapped to Ctrl in SimCoupe, so you'll need to use Ctrl-1 and Ctrl-2.
+Symbol is mapped to Left-Ctrl in SimCoupe, so you'll need to use Ctrl-1 and Ctrl-2.
 
 The emulator supports a type-in feature, allowing text listings to be entered
 as though they were typed.  This feature is currently available to SimCoupe
@@ -25,6 +25,14 @@ the Krusader assembler.
 
 For further details on using the Apple 1 monitor, download the user manual:
   http://simonowen.com/sam/apple1emu/a1man.pdf (2.9MB)
+
+---
+
+Version 1.1 (24/8/2008)
+- Improved 65C02 core for ~20% speed boost
+
+Version 1.0 (19/3/2007)
+- Initial release
 
 ---
 
