@@ -1,6 +1,6 @@
 ; Apple 1 emulator for SAM Coupe, by Simon Owen
 ;
-; Version 1.1 (24/8/2008)
+; Version 1.1 (27/8/2008)
 ;
 ; WWW: http://simonowen.com/sam/apple1emu/
 
