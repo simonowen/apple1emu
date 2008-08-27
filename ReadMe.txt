@@ -28,8 +28,10 @@ For further details on using the Apple 1 monitor, download the user manual:
 
 ---
 
-Version 1.1 (24/8/2008)
+Version 1.1 (27/8/2008)
 - Improved 65C02 core for ~20% speed boost
+- Fixed broken TRB, which was masking the wrong value
+- BIT #imm no longer considers setting N flag
 
 Version 1.0 (19/3/2007)
 - Initial release
