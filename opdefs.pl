@@ -2,12 +2,15 @@
 #
 # Calculates opcode addresses for the inline instruction decoding table
 #
-# Used by the VIC-20 emulator, available from:
+# Used by the Apple 1 emulator, available from:
 #
 #     http://simonowen.com/sam/apple1emu/
 
+$source = 'apple1emu.asm';
+$codeend = 0xc000;
+
 # Assemble, outputting the symbols containing opcode implementation lengths
-$_ = `pyz80.py -s op_.*_len apple1emu.asm`;
+$_ = `pyz80.py -s op_.*_len $source`;
 
 # Create include file for definitions
 my $outfile = 'opdefs.inc';
@@ -19,9 +22,10 @@ if ($?)
 {
     # Create dummy offset list to allow lengths to be calculated
     for (0..255) {
-        printf FILE "op_%02x: equ &b000\n", $_;
+        printf FILE "op_%02x: equ &%04x\n", $_, $codeend-0x1000;
     }
 
+    print "Assembly error, creating dummy definitions!\n";
     exit;
 }
 
@@ -68,8 +72,8 @@ MSB:
     }
 }
 
-# Position base so code finishes just before &c000
-$base = 0xc000 - (($size + 0xff) & ~0xff);
+# Position base so code finishes at the required point
+$base = $codeend - (($size + 0xff) & ~0xff);
 
 print "Size = $size, used = $used, slack = ", $size-$used, "\n";
 

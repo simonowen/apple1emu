@@ -1,6 +1,6 @@
 ; Apple 1 emulator for SAM Coupe, by Simon Owen
 ;
-; Version 1.1 (27/8/2008)
+; Version 1.2 (5/9/2008)
 ;
 ; WWW: http://simonowen.com/sam/apple1emu/
 
@@ -20,8 +20,6 @@ vmpr_mode2:    equ  %00100000       ; Mode 2 select for VMPR
 low_page:      equ  3               ; LMPR during emulation
 screen_page:   equ  5               ; SAM display
 file_page:     equ  6               ; File import text page
-
-bord_invalid:  equ  2               ; Invalid instruction (red)
 
 m6502_nmi:     equ  &fffa           ; nmi vector address
 m6502_reset:   equ  &fffc           ; reset vector address
@@ -139,19 +137,16 @@ back_chr:      ld   a,l
                jr   no_wrap
 
 ; Map display character from SAM to Apple 1
-map_chr:       cp   &20
-               jr   c,invalid_chr
-               and  %10111111
-               xor  %01100000
-               ret
-invalid_chr:   xor  a
+map_chr:       sub  &20
+               ret  nc
+               xor  a
                ret
 
 ; Display character in A at current cursor position
 display_chr:   add  a,a             ; * 2
-               add  a,a             ; * 4
                ld   l,a
                ld   h,0
+               add  hl,hl           ; * 4
                add  hl,hl           ; * 8
                ld   de,font_data
                add  hl,de
@@ -359,7 +354,7 @@ no_key:
                call display_chr     ; show it
                pop  af
 done_draw2:    call advance_chr     ; advance the cursor position
-               ld   a,&3f           ; cursor block
+               ld   a,&5f           ; cursor block
                call display_chr     ; show cursor
 done_draw:
 no_char:
@@ -442,16 +437,13 @@ execute:       ld   a,&1a           ; LD A,(DE)
 
 i_undoc_3:     inc  de              ; 3-byte NOP
 i_undoc_2:     inc  de              ; 2-byte NOP
-i_undoc_1:
-;              ld   a,bord_invalid
-;              out  (border),a
-               jp   (ix)
+i_undoc_1:     jp   (ix)            ; NOP
 
 
 read_write_loop:
 write_loop:    ld   a,h
-               cp   &d0             ; I/O area?
-               jr   z,write_trap
+               cp   base/256        ; emulator or ROMs above?
+               jr   nc,write_trap
 
 zwrite_loop:
 main_loop:     ld   a,(de)          ; 7/7/15  - fetch opcode
@@ -462,11 +454,17 @@ main_loop:     ld   a,(de)          ; 7/7/15  - fetch opcode
                jp   (hl)            ; 4/5/9   - execute!
                                     ; = 35T (official) / 40T (off-screen) / 72T (on-screen)
 
-write_trap:    ld   a,l
+write_trap:    cp   &d0
+               jr   nz,write_rom
+               ld   a,l
                cp   &12             ; display char?
                jr   z,chr_write
                jp   (ix)
 chr_write:     set  7,(hl)          ; display busy
+               jp   (ix)
+
+write_rom:     ld   a,&f3           ; Z80 DI opcode
+               ld   (base),a        ; emulator appears to be in ROM for RAM tests
                jp   (ix)
 
 read_loop:     ld   a,h
@@ -598,8 +596,9 @@ msb_table:     defb op_00>>8, op_01>>8, op_02>>8, op_03>>8, op_04>>8, op_05>>8, 
 
                defs -$\256          ; align to 256-byte boundary
 
+; !"#$%&1()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]`abcdefghijklmnopqrstuvwxyz{|}~
 font_data:
-MDAT "font.bin"
+ MDAT "font.bin"
 
 mask_data:     defb %00000011,%11111111
                defb %11000000,%11111111
@@ -613,18 +612,47 @@ length:        equ  end-start
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-; Instruction implementations
-INC "opimpl.inc"
+ ; Instruction implementations
+ INC "opimpl.inc"
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+ ; Woz Monitor ROM (&ff00-&ffff)
+ ; May be overwritten by includes below
+ dump &ff00
+ MDAT "apple1.rom"
 
-; Ken Wessen's custom BASIC+Krusader+Monitor ROM (&e000-&ffff)
-; BRK handler points to mini-monitor in this version
+
+; Use RAM-based Applesoft BASIC by default
+IF 1
+    ; Applesoft BASIC [Lite] (6000-7FFF)
+    ; http://cowgod.org/replica1/applesoft/
+    dump low_page,&6000
+    MDAT "applesoft-lite-0.4-ram.bin"
+ELSE
+    ; Lee Davidson's Enhanced BASIC (5800-77CE)
+    ; http://members.lycos.co.uk/leeedavison/6502/ehbasic/
+    dump low_page,&5800
+    MDAT "ehbasic.bin"
+ENDIF
+
+
+; Use Ken Wessen's BASIC+assembler by default
+IF 1
+    ; Ken Wessen's custom BASIC + Krusader assembler + enhanced monitor (E000-FFFF)
+    ; BRK handler points to mini-monitor in this version
+    ; http://school.anhb.uwa.edu.au/personalpages/kwessen/apple1/Krusader.htm
     dump &e000
-MDAT "65C02.rom.bin"
+    MDAT "65C02.rom.bin"
+ELSE
+    ; Applesoft BASIC [Lite] + Woz monitor (E000-FFFF)
+    ; http://cowgod.org/replica1/applesoft/
+    dump &e000
+    MDAT "applesoft-lite-0.4.bin"
+ENDIF
 
-; Original Monitor ROM (&ff00-&ffff)
-; If uncommented, this will replace the monitor ROM section from above
-    dump &ff00
-MDAT "apple1.rom"
+
+ ; Test program to output the character set (5000-500B)
+ ; LDX $00 ; loop: TXA ; JSR echo ; INX ; BRA loop
+ dump low_page,&5000
+ defb &a2, &00, &8a, &20, &ef, &ff, &e8, &80, &f9
