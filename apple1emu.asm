@@ -4,7 +4,7 @@
 ;
 ; WWW: http://simonowen.com/sam/apple1emu/
 
-base:          equ  &a000           ; Spare-ish Apple 1 space
+base:          equ  &d000           ; Emulator code shares Apple 1 I/O area
 
 status:        equ  &f9             ; Status and extended keyboard port
 lmpr:          equ  &fa             ; Low Memory Page Register
@@ -25,10 +25,11 @@ m6502_nmi:     equ  &fffa           ; nmi vector address
 m6502_reset:   equ  &fffc           ; reset vector address
 m6502_int:     equ  &fffe           ; int vector address (also for BRK)
 
+r1onclbc:      equ  &01ea           ; ROM 1 on, call BC
 getkey:        equ  &1cab           ; SAM ROM key reading (NZ=got key in A, A=0 for no key)
 
 
-; Apple 1 keyboard and display I/O locations
+; PIA registers for keyboard and display I/O
 
 kbd_data:      equ &d010            ; keyboard data
 kbd_ctrl:      equ &d011            ; keyboard control
@@ -41,16 +42,25 @@ dsp_ctrl:      equ &d013            ; display control
                dump $
                autoexec
 
-start:         di
+               di
+               jr   start
 
-               ld   a,low_page+rom0_off
+               defs kbd_data-$
+               ; This gap contains the PIA locations from above
+               defs dsp_ctrl-kbd_data+1
+
+start:         ld   a,low_page+rom0_off
                out  (lmpr),a
                ld   a,vmpr_mode2+screen_page
                out  (vmpr),a
+               ld   (basic_stack),sp
                ld   sp,stack_top
 
                call set_sam_attrs   ; set the mode 2 attrs so the screen is visible
                call setup_im2       ; enable IM 2
+
+               ld   a,(op_00)       ; lowest address used by emulator
+               ld   (rom_write+1),a ; save byte to restore to simulate ROM
 
 reset_loop:    ld   hl,0
                ld   (dsp_data),hl   ; display ready
@@ -243,10 +253,6 @@ file_skip:     ld   a,(hl)          ; fetch next file character
                jr   nz,file_done
                ld   a,&0d           ; convert LF to CR
 file_done:     ld   (filepos),hl
-               ex   af,af'
-               ld   a,screen_page+rom0_off
-               out  (lmpr),a
-               ex   af,af'
                and  a
                ret
 filepos:       defw 0
@@ -282,7 +288,6 @@ update_io:
                ld   a,&c9           ; RET opcode
                ld   (main_loop),a   ; return to reset on next instruction
 not_reset:
-               jr   c,got_key       ; unshifted gives chr
 
 still_esc:     ld   a,&f7
                in   a,(status)
@@ -315,13 +320,13 @@ not_sym:
                call get_filekey     ; got a type-in key from file?
                jr   nz,got_key      ; jump if we have
 
-skip_key:      ld   a,&1f+rom1_on
+skip_key:      ld   a,&1f           ; LMPR page for BASIC, with ROM 0 enabled
                out  (lmpr),a
-               call getkey
-               ex   af,af'
-               ld   a,screen_page+rom0_off
-               out  (lmpr),a
-               ex   af,af'
+               ld   (save_stack),sp
+               ld   sp,(basic_stack)
+               ld   bc,getkey       ; return key code in A, zero for none
+               call r1onclbc
+               ld   sp,(save_stack)
                jr   z,no_key
                call map_key
                and  a
@@ -343,6 +348,8 @@ no_key:
                cp   &7f
                jr   z,done_draw
                push af
+               ld   a,screen_page+rom0_off
+               out  (lmpr),a        ; page in screen
                ld   a,&00           ; space
                call display_chr     ; erase cursor
                pop  af
@@ -392,11 +399,7 @@ im2_handler:   push af
 
                in   a,(lmpr)
                push af
-               ld   a,screen_page+rom0_off
-               out  (lmpr),a
-
                call update_io
-
                pop  af
                out  (lmpr),a
 
@@ -425,6 +428,9 @@ im2_table:     defs 257
 stack_top:                          ; stack fits nicely in the slack space
 im2_jp:        jp   im2_handler
 
+basic_stack:   defw 0
+save_stack:    defw 0
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -442,7 +448,7 @@ i_undoc_1:     jp   (ix)            ; NOP
 
 read_write_loop:
 write_loop:    ld   a,h
-               cp   base/256        ; emulator or ROMs above?
+               cp   op_00/256       ; MSB of lowest emulator byte
                jr   nc,write_trap
 
 zwrite_loop:
@@ -454,8 +460,8 @@ main_loop:     ld   a,(de)          ; 7/7/15  - fetch opcode
                jp   (hl)            ; 4/5/9   - execute!
                                     ; = 35T (official) / 40T (off-screen) / 72T (on-screen)
 
-write_trap:    cp   &d0
-               jr   nz,write_rom
+write_trap:    cp   &d0             ; I/O page?
+               jr   nz,rom_write
                ld   a,l
                cp   &12             ; display char?
                jr   z,chr_write
@@ -463,8 +469,8 @@ write_trap:    cp   &d0
 chr_write:     set  7,(hl)          ; display busy
                jp   (ix)
 
-write_rom:     ld   a,&f3           ; Z80 DI opcode
-               ld   (base),a        ; emulator appears to be in ROM for RAM tests
+rom_write:     ld   a,&00           ; patched by starting code
+               ld   (op_00),a       ; emulator appears read-only to be ROM for RAM tests
                jp   (ix)
 
 read_loop:     ld   a,h
