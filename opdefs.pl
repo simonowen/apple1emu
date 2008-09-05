@@ -7,7 +7,7 @@
 #     http://simonowen.com/sam/apple1emu/
 
 $source = 'apple1emu.asm';
-$codeend = 0xc000;
+$codeend = 0xd000;
 
 # Assemble, outputting the symbols containing opcode implementation lengths
 $_ = `pyz80.py -s op_.*_len $source`;
@@ -44,7 +44,7 @@ foreach $op (@todo)
 {
 MSB:
     # Work up through MSB values until we find a space
-    for ($msb = 0; ; $msb++)
+    for ($msb = 0 ; ; $msb++)
     {
         # Determine the extent of the opcode in the current MSB
         my $start = ($msb << 8) | $op;
@@ -78,9 +78,7 @@ $base = $codeend - (($size + 0xff) & ~0xff);
 print "Size = $size, used = $used, slack = ", $size-$used, "\n";
 
 # Output sorted list of calculated positions
-foreach (sort { $a <=> $b } @todo)
-{
-    my $offset = $base + $off{$_};
+foreach (sort { $a <=> $b } @todo) {
     printf FILE "op_%02x:         equ  &%04x ; +$len{$_}\n", $_, $base+$off{$_};
 }
 
