@@ -283,8 +283,8 @@ i_ora_iy:      ld   a,(de)          ; ORA ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                ld   a,b             ; A
                or   (hl)            ; A|x
@@ -765,8 +765,8 @@ i_and_iy:      ld   a,(de)          ; AND ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                ld   a,b             ; A
                and  (hl)            ; A&x
@@ -1218,8 +1218,8 @@ i_eor_iy:      ld   a,(de)          ; EOR ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                ld   a,b             ; A
                xor  (hl)            ; A^x
@@ -1655,8 +1655,8 @@ i_adc_iy:      ld   a,(de)          ; ADC ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                jp   i_adc
 op_71_len:     equ  $-op_71
@@ -2075,8 +2075,8 @@ i_sta_iy:      ld   a,(de)          ; STA ($nn),Y
                inc  l
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                ld   (hl),b          ; store A
                jp   write_loop
@@ -2482,8 +2482,8 @@ i_lda_iy:      ld   a,(de)          ; LDA ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                ld   b,(hl)          ; set A
                ld   c,b             ; set N Z
@@ -2927,8 +2927,8 @@ i_cmp_iy:      ld   a,(de)          ; CMP ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                ex   af,af'          ; carry
                ld   a,b             ; A
@@ -3365,8 +3365,8 @@ i_sbc_iy:      ld   a,(de)          ; SBC ($nn),Y
                inc  l               ; (may wrap in zero page)
                ld   h,(hl)
                ld   l,a
-               ld   a,0
                adc  a,h
+               sub  l
                ld   h,a
                jp   i_sbc
 op_f1_len:     equ  $-op_f1
